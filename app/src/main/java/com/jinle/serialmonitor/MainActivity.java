@@ -42,6 +42,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class MainActivity extends Activity implements Ch348Device.Listener {
@@ -56,6 +57,7 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
     private final TextView[] stateViews = new TextView[CHANNEL_COUNT];
     private final long[] receiveCounts = new long[CHANNEL_COUNT];
     private final AtomicLong recordSequence = new AtomicLong();
+    private final AtomicBoolean connectionInProgress = new AtomicBoolean(false);
     private final Object recordLock = new Object();
 
     private UsbManager usbManager;
@@ -69,12 +71,15 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
     private BufferedWriter recordWriter;
     private Uri recordUri;
     private long recordCount;
+    private boolean permissionRequestInFlight;
+    private boolean destroyed;
 
     private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             String action = intent.getAction();
             if (ACTION_USB_PERMISSION.equals(action)) {
+                permissionRequestInFlight = false;
                 boolean granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
                 if (!granted) setOverallStatus("USB权限被拒绝，请点击重新连接", false);
                 else scanAndConnect();
@@ -82,7 +87,7 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
                 scanAndConnect();
             } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
                 UsbDevice detached = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
-                if (detached != null) handleDetach(detached);
+                if (isSupportedDevice(detached)) handleDetach(detached);
             }
         }
     };
@@ -204,11 +209,11 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
     }
 
     private void scanAndConnect() {
+        if (destroyed) return;
         setOverallStatus("正在检测并连接…", true);
         List<UsbDevice> found = new ArrayList<>();
         for (UsbDevice device : usbManager.getDeviceList().values()) {
-            if (device.getVendorId() == Ch348Device.VENDOR_ID &&
-                    device.getProductId() == Ch348Device.PRODUCT_ID) found.add(device);
+            if (isSupportedDevice(device)) found.add(device);
         }
         found.sort(Comparator.comparing(UsbDevice::getDeviceName));
 
@@ -221,21 +226,33 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
             setOverallStatus("仅检测到1片CH348（8路）", false);
         }
 
-        boolean permissionMissing = false;
+        UsbDevice permissionMissing = null;
         for (UsbDevice device : found) {
             if (!usbManager.hasPermission(device)) {
-                permissionMissing = true;
-                usbManager.requestPermission(device, permissionIntent);
+                permissionMissing = device;
+                break;
             }
         }
-        if (permissionMissing) {
+        if (permissionMissing != null) {
             setOverallStatus("请允许USB访问权限", true);
+            // Android may deliver one permission result for each device. Request them
+            // sequentially so two callbacks cannot queue two competing reconnects.
+            if (!permissionRequestInFlight) {
+                permissionRequestInFlight = true;
+                usbManager.requestPermission(permissionMissing, permissionIntent);
+            }
             return;
         }
 
+        if (!connectionInProgress.compareAndSet(false, true)) return;
         final List<UsbDevice> devicesToOpen = found.size() > 2
                 ? new ArrayList<>(found.subList(0, 2)) : found;
         usbExecutor.execute(() -> openDevices(devicesToOpen));
+    }
+
+    private static boolean isSupportedDevice(UsbDevice device) {
+        return device != null && device.getVendorId() == Ch348Device.VENDOR_ID &&
+                device.getProductId() == Ch348Device.PRODUCT_ID;
     }
 
     private void openDevices(List<UsbDevice> devices) {
@@ -261,6 +278,8 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
         } catch (Exception error) {
             for (Ch348Device device : newlyOpened) device.close();
             runOnUiThread(() -> setOverallStatus("连接失败：" + error.getMessage(), false));
+        } finally {
+            connectionInProgress.set(false);
         }
     }
 
@@ -394,12 +413,22 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
     }
 
     private void handleDetach(UsbDevice detached) {
+        boolean removed = false;
         synchronized (openedDevices) {
-            for (Ch348Device opened : openedDevices) {
-                if (opened.getUsbDevice().getDeviceId() == detached.getDeviceId()) opened.close();
+            for (int i = openedDevices.size() - 1; i >= 0; i--) {
+                Ch348Device opened = openedDevices.get(i);
+                if (opened.getUsbDevice().getDeviceId() == detached.getDeviceId()) {
+                    opened.close();
+                    openedDevices.remove(i);
+                    removed = true;
+                }
             }
         }
-        setOverallStatus("USB设备已断开", false);
+        permissionRequestInFlight = false;
+        if (removed || isSupportedDevice(detached)) {
+            setOverallStatus("CH348已断开，等待设备恢复", false);
+            mainHandler.postDelayed(this::scanAndConnect, 1000);
+        }
     }
 
     private void closeOpenedDevices() {
@@ -458,6 +487,8 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
 
     @Override
     protected void onDestroy() {
+        destroyed = true;
+        mainHandler.removeCallbacksAndMessages(null);
         if (recording || recordWriter != null) stopRecording();
         closeOpenedDevices();
         unregisterReceiver(usbReceiver);
