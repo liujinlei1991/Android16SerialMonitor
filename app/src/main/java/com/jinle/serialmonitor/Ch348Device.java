@@ -186,7 +186,7 @@ final class Ch348Device implements Closeable {
         byte[] version = new byte[4];
         int versionLength = connection.controlTransfer(
                 UsbConstants.USB_DIR_IN | UsbConstants.USB_TYPE_VENDOR |
-                        UsbConstants.USB_RECIP_DEVICE,
+                        0x00, // USB_RECIP_DEVICE
                 CMD_VER, 0, 0, version, version.length, IO_TIMEOUT_MS);
         if (versionLength == 4 && (version[0] & 0xFF) >= 0x8A) {
             byte[] uploadMode = new byte[8];
