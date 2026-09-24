@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- WCH CH348 / CH9344-compatible eight-port USB serial device -->
+    <usb-device vendor-id="6790" product-id="21977" />
+</resources>
