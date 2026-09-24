@@ -18,6 +18,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.view.Gravity;
 import android.view.View;
@@ -64,15 +65,46 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
     private PendingIntent permissionIntent;
     private TextView overallStatus;
     private TextView recordStatus;
-    private Button startButton;
-    private Button stopButton;
+    private Button measureButton;
+    private Button resetButton;
+    private View liveView;
+    private LinearLayout resultPanel;
+    private BodyContourView contourView;
+    private TextView waistResultView;
+    private TextView hipResultView;
+    private TextView ratioResultView;
+    private TextView qualityResultView;
     private boolean groupsSwapped;
     private volatile boolean recording;
+    private volatile boolean phaseMeasuring;
+    private volatile int activePhase = -1;
+    private int nextPhase;
+    private long phaseEndsAt;
+    private MeasurementSession measurementSession = new MeasurementSession();
+    private int[] phaseAttempts = new int[MeasurementSession.PHASE_COUNT];
     private BufferedWriter recordWriter;
     private Uri recordUri;
     private long recordCount;
     private boolean permissionRequestInFlight;
     private boolean destroyed;
+
+    private final Runnable measurementTicker = new Runnable() {
+        @Override
+        public void run() {
+            if (!phaseMeasuring || destroyed) return;
+            long remaining = phaseEndsAt - SystemClock.elapsedRealtime();
+            if (remaining <= 0) {
+                finishMeasurementPhase();
+                return;
+            }
+            double seconds = remaining / 1000.0;
+            String phaseName = MeasurementSession.PHASE_NAMES[activePhase];
+            measureButton.setText(String.format(Locale.CHINA, "%s测量中 · %.1f秒", phaseName, seconds));
+            recordStatus.setText(String.format(Locale.CHINA, "%s采集中 · %.1f秒 · %,d条",
+                    phaseName, seconds, measurementSession.getPhaseSampleCount(activePhase)));
+            mainHandler.postDelayed(this, 100);
+        }
+    };
 
     private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
         @Override
@@ -134,8 +166,8 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
 
         LinearLayout titles = new LinearLayout(this);
         titles.setOrientation(LinearLayout.VERTICAL);
-        TextView title = text("16路 USB 距离监测", 24, Color.WHITE, true);
-        TextView subtitle = text("WCH CH348 × 2  ·  115200 baud  ·  8N1", 13,
+        TextView title = text("腰臀围四方向测量", 24, Color.WHITE, true);
+        TextView subtitle = text("16层 · 635–1235 mm · 层间距40 mm · 每方向10秒", 13,
                 Color.rgb(176, 196, 219), false);
         titles.addView(title);
         titles.addView(subtitle);
@@ -160,16 +192,15 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
         swap.setOnClickListener(v -> swapGroups());
         controls.addView(swap);
 
-        startButton = button("开始记录", Color.rgb(10, 124, 102));
-        startButton.setOnClickListener(v -> startRecording());
-        controls.addView(startButton);
+        measureButton = button("开始正面测量（10秒）", Color.rgb(10, 124, 102));
+        measureButton.setOnClickListener(v -> startMeasurementPhase());
+        controls.addView(measureButton);
 
-        stopButton = button("结束并保存", Color.rgb(190, 72, 64));
-        stopButton.setEnabled(false);
-        stopButton.setOnClickListener(v -> stopRecording());
-        controls.addView(stopButton);
+        resetButton = button("重新测量", Color.rgb(190, 72, 64));
+        resetButton.setOnClickListener(v -> resetMeasurement());
+        controls.addView(resetButton);
 
-        recordStatus = text("未记录", 13, Color.rgb(76, 91, 110), false);
+        recordStatus = text("准备测量：请正对传感器站立", 13, Color.rgb(76, 91, 110), false);
         controls.addView(recordStatus, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
         root.addView(controls);
 
@@ -186,9 +217,45 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
             }});
         }
         scroll.addView(grid);
+        liveView = scroll;
         root.addView(scroll, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
+
+        resultPanel = makeResultPanel();
+        resultPanel.setVisibility(View.GONE);
+        root.addView(resultPanel, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
         setContentView(root);
+    }
+
+    private LinearLayout makeResultPanel() {
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.HORIZONTAL);
+        panel.setPadding(dp(12), dp(10), dp(12), dp(12));
+        panel.setBackgroundColor(Color.rgb(238, 243, 249));
+
+        contourView = new BodyContourView(this);
+        panel.addView(contourView, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.MATCH_PARENT, 1));
+
+        LinearLayout metrics = new LinearLayout(this);
+        metrics.setOrientation(LinearLayout.VERTICAL);
+        metrics.setPadding(dp(22), dp(18), dp(22), dp(18));
+        metrics.setBackground(roundRect(Color.WHITE, 10));
+        TextView heading = text("测量结果", 20, Color.rgb(19, 49, 76), true);
+        waistResultView = text("腰围 -- cm", 30, Color.rgb(226, 112, 56), true);
+        hipResultView = text("臀围 -- cm", 30, Color.rgb(120, 82, 170), true);
+        ratioResultView = text("腰臀比 --", 20, Color.rgb(31, 93, 140), true);
+        qualityResultView = text("", 13, Color.rgb(90, 105, 124), false);
+        qualityResultView.setPadding(0, dp(14), 0, 0);
+        metrics.addView(heading);
+        metrics.addView(waistResultView);
+        metrics.addView(hipResultView);
+        metrics.addView(ratioResultView);
+        metrics.addView(qualityResultView);
+        panel.addView(metrics, new LinearLayout.LayoutParams(dp(310),
+                LinearLayout.LayoutParams.MATCH_PARENT));
+        return panel;
     }
 
     private View makeChannelCard(int index) {
@@ -296,7 +363,13 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
         if (index < 0 || index >= CHANNEL_COUNT) return;
         long count = ++receiveCounts[index];
 
-        if (recording) writeRecord(index, port, raw, distanceMm);
+        int phase = activePhase;
+        if (phaseMeasuring && phase >= 0 && distanceMm != null) {
+            measurementSession.addSample(phase, index, distanceMm);
+        }
+        if (recording && phaseMeasuring && phase >= 0) {
+            writeRecord(phase, index, port, raw, distanceMm);
+        }
         mainHandler.post(() -> {
             if (distanceMm != null) {
                 String value = Math.rint(distanceMm) == distanceMm
@@ -316,10 +389,123 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
         runOnUiThread(() -> setOverallStatus(message, false));
     }
 
-    private void startRecording() {
-        if (recording) return;
+    private void startMeasurementPhase() {
+        if (phaseMeasuring || nextPhase >= MeasurementSession.PHASE_COUNT) return;
+        int connected;
+        synchronized (openedDevices) {
+            connected = openedDevices.size();
+        }
+        if (connected < 2) {
+            Toast.makeText(this, "需要两片CH348全部在线后才能进行16层测量", Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (nextPhase == MeasurementSession.PHASE_FRONT && !recording && !startRecording()) return;
+
+        liveView.setVisibility(View.VISIBLE);
+        resultPanel.setVisibility(View.GONE);
+        activePhase = nextPhase;
+        phaseAttempts[activePhase]++;
+        phaseMeasuring = true;
+        phaseEndsAt = SystemClock.elapsedRealtime() + 10_000L;
+        measureButton.setEnabled(false);
+        resetButton.setEnabled(false);
+        markAllWaiting(MeasurementSession.PHASE_NAMES[activePhase] + "测量中");
+        mainHandler.removeCallbacks(measurementTicker);
+        mainHandler.post(measurementTicker);
+    }
+
+    private void finishMeasurementPhase() {
+        if (!phaseMeasuring || activePhase < 0) return;
+        int completedPhase = activePhase;
+        phaseMeasuring = false;
+        activePhase = -1;
+        mainHandler.removeCallbacks(measurementTicker);
+        resetButton.setEnabled(true);
+
+        int validLayers = measurementSession.getPhaseValidLayerCount(completedPhase);
+        int sampleCount = measurementSession.getPhaseSampleCount(completedPhase);
+        if (validLayers < 12) {
+            measurementSession.clearPhase(completedPhase);
+            nextPhase = completedPhase;
+            measureButton.setEnabled(true);
+            measureButton.setText("重新测量" + MeasurementSession.PHASE_NAMES[completedPhase] + "（10秒）");
+            recordStatus.setText(String.format(Locale.CHINA,
+                    "%s数据不足：%,d条/%d层有效，至少需要12层，请检查串口后重测",
+                    MeasurementSession.PHASE_NAMES[completedPhase], sampleCount, validLayers));
+            Toast.makeText(this, "有效数据不足，请保持站位并重测本方向", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        nextPhase = completedPhase + 1;
+        if (nextPhase < MeasurementSession.PHASE_COUNT) {
+            String nextName = MeasurementSession.PHASE_NAMES[nextPhase];
+            measureButton.setEnabled(true);
+            measureButton.setText("开始" + nextName + "测量（10秒）");
+            recordStatus.setText(String.format(Locale.CHINA,
+                    "%s完成 · %,d条/%d层有效；请转身至%s后再按按钮",
+                    MeasurementSession.PHASE_NAMES[completedPhase], sampleCount, validLayers, nextName));
+            Toast.makeText(this, "本方向测量完成，请转身至" + nextName, Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        MeasurementSession.Result result = measurementSession.calculate();
+        appendMeasurementSummary(result);
+        stopRecording();
+        showMeasurementResult(result);
+        measureButton.setText("四方向测量已完成");
+        measureButton.setEnabled(false);
+    }
+
+    private void resetMeasurement() {
+        if (phaseMeasuring) {
+            Toast.makeText(this, "当前10秒测量尚未结束", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (recording || recordWriter != null) stopRecording();
+        measurementSession = new MeasurementSession();
+        phaseAttempts = new int[MeasurementSession.PHASE_COUNT];
+        nextPhase = 0;
+        activePhase = -1;
+        liveView.setVisibility(View.VISIBLE);
+        resultPanel.setVisibility(View.GONE);
+        measureButton.setEnabled(true);
+        resetButton.setEnabled(true);
+        measureButton.setText("开始正面测量（10秒）");
+        recordStatus.setText("准备测量：请正对传感器站立");
+    }
+
+    private void showMeasurementResult(MeasurementSession.Result result) {
+        contourView.setResult(result);
+        liveView.setVisibility(View.GONE);
+        resultPanel.setVisibility(View.VISIBLE);
+        if (result.hasMeasurement()) {
+            waistResultView.setText(String.format(Locale.CHINA, "腰围 %.1f cm", result.waistCm()));
+            hipResultView.setText(String.format(Locale.CHINA, "臀围 %.1f cm", result.hipCm()));
+            ratioResultView.setText(String.format(Locale.CHINA, "腰臀比 %.2f", result.waistHipRatio()));
+        } else {
+            waistResultView.setText("腰围 -- cm");
+            hipResultView.setText("臀围 -- cm");
+            ratioResultView.setText("腰臀比 --");
+        }
+        String quality = "有效轮廓：" + result.validLayers + "/16层";
+        if (result.waistLayer >= 0) {
+            quality += "\n腰部：第" + (result.waistLayer + 1) + "层 / " +
+                    Math.round(result.heightsMm[result.waistLayer]) + " mm";
+        }
+        if (result.hipLayer >= 0) {
+            quality += "\n臀部：第" + (result.hipLayer + 1) + "层 / " +
+                    Math.round(result.heightsMm[result.hipLayer]) + " mm";
+        }
+        if (result.warning != null) quality += "\n提示：" + result.warning;
+        qualityResultView.setText(quality);
+        recordStatus.setText(result.summary() + " · 数据已保存到 下载/串口距离记录");
+    }
+
+    private boolean startRecording() {
+        if (recording) return true;
         try {
-            String filename = "距离记录_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".csv";
+            String filename = "腰臀围四方向测量_" +
+                    new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".csv";
             ContentValues values = new ContentValues();
             values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
             values.put(MediaStore.MediaColumns.MIME_TYPE, "text/csv");
@@ -332,40 +518,65 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
             if (stream == null) throw new IOException("不能打开记录文件");
             recordWriter = new BufferedWriter(new OutputStreamWriter(stream, StandardCharsets.UTF_8));
             recordWriter.write('\uFEFF');
-            recordWriter.write("\"时间\",\"序号\",\"层号\",\"设备\",\"通道\",\"距离_mm\",\"原始数据\"\n");
+            recordWriter.write("\"时间\",\"序号\",\"方向\",\"层号\",\"设备\",\"通道\",\"距离_mm\",\"原始数据\"\n");
             recordSequence.set(0);
             recordCount = 0;
             recording = true;
-            startButton.setEnabled(false);
-            stopButton.setEnabled(true);
-            recordStatus.setText("正在记录 · 0条");
+            return true;
         } catch (Exception error) {
             Toast.makeText(this, "开始记录失败：" + error.getMessage(), Toast.LENGTH_LONG).show();
             abandonRecord();
+            return false;
         }
     }
 
-    private void writeRecord(int index, int port, String raw, Double distanceMm) {
+    private void writeRecord(int phase, int index, int port, String raw, Double distanceMm) {
         synchronized (recordLock) {
             if (!recording || recordWriter == null) return;
             try {
                 long sequence = recordSequence.incrementAndGet();
                 String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(new Date());
-                String row = csv(timestamp) + ',' + sequence + ',' + (index + 1) + ',' +
+                String row = csv(timestamp) + ',' + sequence + ',' +
+                        csv(MeasurementSession.PHASE_NAMES[phase] + "-第" + phaseAttempts[phase] + "次") + ',' +
+                        (index + 1) + ',' +
                         csv("设备" + (index / 8 + 1)) + ',' + csv(String.valueOf(CHANNEL_NAMES[port])) + ',' +
                         (distanceMm == null ? "" : distanceMm) + ',' + csv(raw) + '\n';
                 recordWriter.write(row);
                 recordCount++;
                 if (recordCount % 50 == 0) recordWriter.flush();
-                if (recordCount % 10 == 0) {
-                    long shown = recordCount;
-                    mainHandler.post(() -> recordStatus.setText(String.format(Locale.CHINA, "正在记录 · %,d条", shown)));
-                }
             } catch (IOException error) {
                 recording = false;
                 mainHandler.post(() -> Toast.makeText(this, "记录写入失败：" + error.getMessage(), Toast.LENGTH_LONG).show());
             }
         }
+    }
+
+    private void appendMeasurementSummary(MeasurementSession.Result result) {
+        synchronized (recordLock) {
+            if (recordWriter == null) return;
+            try {
+                recordWriter.write("\n\"汇总层号\",\"高度_mm\",\"正面中位数_mm\",\"左侧中位数_mm\",\"背面中位数_mm\",\"右侧中位数_mm\",\"左右径_mm\",\"前后径_mm\",\"椭圆周长_mm\"\n");
+                for (int layer = 0; layer < MeasurementSession.LAYER_COUNT; layer++) {
+                    recordWriter.write((layer + 1) + "," + result.heightsMm[layer] + "," +
+                            number(result.medianDistancesMm[MeasurementSession.PHASE_FRONT][layer]) + "," +
+                            number(result.medianDistancesMm[MeasurementSession.PHASE_LEFT][layer]) + "," +
+                            number(result.medianDistancesMm[MeasurementSession.PHASE_BACK][layer]) + "," +
+                            number(result.medianDistancesMm[MeasurementSession.PHASE_RIGHT][layer]) + "," +
+                            number(result.widthsMm[layer]) + "," + number(result.depthsMm[layer]) + "," +
+                            number(result.circumferencesMm[layer]) + "\n");
+                }
+                recordWriter.write("\n\"计算结果\",\"腰围_cm\",\"臀围_cm\",\"腰臀比\"\n");
+                recordWriter.write("\"result\"," + number(result.waistCm()) + "," +
+                        number(result.hipCm()) + "," + number(result.waistHipRatio()) + "\n");
+                recordWriter.flush();
+            } catch (IOException error) {
+                Toast.makeText(this, "汇总写入失败：" + error.getMessage(), Toast.LENGTH_LONG).show();
+            }
+        }
+    }
+
+    private static String number(double value) {
+        return Double.isFinite(value) ? String.format(Locale.US, "%.3f", value) : "";
     }
 
     private void stopRecording() {
@@ -389,9 +600,7 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
             done.put(MediaStore.MediaColumns.IS_PENDING, 0);
             getContentResolver().update(completedUri, done, null, null);
         }
-        startButton.setEnabled(true);
-        stopButton.setEnabled(false);
-        recordStatus.setText(String.format(Locale.CHINA, "已保存 · %,d条 · 下载/串口距离记录", recordCount));
+        recordStatus.setText(String.format(Locale.CHINA, "数据已保存 · %,d条 · 下载/串口距离记录", recordCount));
         Toast.makeText(this, "记录已保存到 下载/串口距离记录", Toast.LENGTH_LONG).show();
     }
 
@@ -488,6 +697,8 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
     @Override
     protected void onDestroy() {
         destroyed = true;
+        phaseMeasuring = false;
+        activePhase = -1;
         mainHandler.removeCallbacksAndMessages(null);
         if (recording || recordWriter != null) stopRecording();
         closeOpenedDevices();
