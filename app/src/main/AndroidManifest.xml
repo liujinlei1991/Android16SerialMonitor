@@ -4,7 +4,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="16路距离监测"
+        android:label="腰臀围测量"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
         <activity
