@@ -8,23 +8,23 @@ import java.util.Locale;
 
 /** Collects four views and converts the 16 radar layers into ellipse measurements. */
 final class MeasurementSession {
-    static final int PHASE_FRONT = 0;
-    static final int PHASE_LEFT = 1;
-    static final int PHASE_BACK = 2;
-    static final int PHASE_RIGHT = 3;
-    static final int PHASE_COUNT = 4;
+    static final int FACE_FRONT = 0;
+    static final int FACE_LEFT = 1;
+    static final int FACE_BACK = 2;
+    static final int FACE_RIGHT = 3;
+    static final int FACE_COUNT = 4;
     static final int LAYER_COUNT = 16;
     static final double SENSOR_CENTER_DISTANCE_MM = 500.0;
     static final double FIRST_SENSOR_HEIGHT_MM = 635.0;
     static final double SENSOR_SPACING_MM = 40.0;
 
-    static final String[] PHASE_NAMES = {"正面", "左侧面", "背面", "右侧面"};
+    static final String[] FACE_NAMES = {"正面", "左侧面", "背面", "右侧面"};
 
     @SuppressWarnings("unchecked")
-    private final List<Double>[][] samples = new ArrayList[PHASE_COUNT][LAYER_COUNT];
+    private final List<Double>[][] samples = new ArrayList[FACE_COUNT][LAYER_COUNT];
 
     MeasurementSession() {
-        for (int phase = 0; phase < PHASE_COUNT; phase++) {
+        for (int phase = 0; phase < FACE_COUNT; phase++) {
             for (int layer = 0; layer < LAYER_COUNT; layer++) {
                 samples[phase][layer] = new ArrayList<>();
             }
@@ -32,7 +32,7 @@ final class MeasurementSession {
     }
 
     synchronized void addSample(int phase, int layer, double distanceMm) {
-        if (phase < 0 || phase >= PHASE_COUNT || layer < 0 || layer >= LAYER_COUNT) return;
+        if (phase < 0 || phase >= FACE_COUNT || layer < 0 || layer >= LAYER_COUNT) return;
         // Broad physical gate. Temporal median and cross-height smoothing reject remaining spikes.
         if (!Double.isFinite(distanceMm) || distanceMm < 100.0 || distanceMm > 600.0) return;
         samples[phase][layer].add(distanceMm);
@@ -42,13 +42,13 @@ final class MeasurementSession {
         return samples[phase][layer].size();
     }
 
-    synchronized int getPhaseSampleCount(int phase) {
+    synchronized int getFaceSampleCount(int phase) {
         int count = 0;
         for (int layer = 0; layer < LAYER_COUNT; layer++) count += samples[phase][layer].size();
         return count;
     }
 
-    synchronized int getPhaseValidLayerCount(int phase) {
+    synchronized int getFaceValidLayerCount(int phase) {
         int count = 0;
         for (int layer = 0; layer < LAYER_COUNT; layer++) {
             if (samples[phase][layer].size() >= 3) count++;
@@ -56,15 +56,15 @@ final class MeasurementSession {
         return count;
     }
 
-    synchronized void clearPhase(int phase) {
-        if (phase < 0 || phase >= PHASE_COUNT) return;
+    synchronized void clearFace(int phase) {
+        if (phase < 0 || phase >= FACE_COUNT) return;
         for (int layer = 0; layer < LAYER_COUNT; layer++) samples[phase][layer].clear();
     }
 
     synchronized Result calculate() {
-        double[][] distances = new double[PHASE_COUNT][LAYER_COUNT];
-        int[][] counts = new int[PHASE_COUNT][LAYER_COUNT];
-        for (int phase = 0; phase < PHASE_COUNT; phase++) {
+        double[][] distances = new double[FACE_COUNT][LAYER_COUNT];
+        int[][] counts = new int[FACE_COUNT][LAYER_COUNT];
+        for (int phase = 0; phase < FACE_COUNT; phase++) {
             for (int layer = 0; layer < LAYER_COUNT; layer++) {
                 counts[phase][layer] = samples[phase][layer].size();
                 distances[phase][layer] = samples[phase][layer].size() >= 3
@@ -83,10 +83,10 @@ final class MeasurementSession {
         int validLayers = 0;
         for (int layer = 0; layer < LAYER_COUNT; layer++) {
             height[layer] = FIRST_SENSOR_HEIGHT_MM + SENSOR_SPACING_MM * layer;
-            double frontRadius = SENSOR_CENTER_DISTANCE_MM - distances[PHASE_FRONT][layer];
-            double leftRadius = SENSOR_CENTER_DISTANCE_MM - distances[PHASE_LEFT][layer];
-            double backRadius = SENSOR_CENTER_DISTANCE_MM - distances[PHASE_BACK][layer];
-            double rightRadius = SENSOR_CENTER_DISTANCE_MM - distances[PHASE_RIGHT][layer];
+            double frontRadius = SENSOR_CENTER_DISTANCE_MM - distances[FACE_FRONT][layer];
+            double leftRadius = SENSOR_CENTER_DISTANCE_MM - distances[FACE_LEFT][layer];
+            double backRadius = SENSOR_CENTER_DISTANCE_MM - distances[FACE_BACK][layer];
+            double rightRadius = SENSOR_CENTER_DISTANCE_MM - distances[FACE_RIGHT][layer];
             if (!validRadius(frontRadius) || !validRadius(leftRadius) ||
                     !validRadius(backRadius) || !validRadius(rightRadius)) continue;
 
